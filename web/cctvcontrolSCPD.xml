@@ -1,0 +1,99 @@
+<?xml version="1.0"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+
+  <specVersion>
+    <major>1</major>
+    <minor>0</minor>
+  </specVersion>
+
+
+  <actionList>
+
+    <action>
+      <name>PowerOn</name>
+      <argumentList>
+         <argument>
+           <retval />
+           <name>Power</name>
+           <relatedStateVariable>Power</relatedStateVariable>
+           <direction>out</direction>
+          </argument>
+      </argumentList>
+    </action>
+
+    <action>
+      <name>PowerOff</name>    
+      <argumentList>
+         <argument>
+           <retval />
+           <name>Power</name>
+           <relatedStateVariable>Power</relatedStateVariable>
+           <direction>out</direction>
+          </argument>
+      </argumentList>
+    </action>
+
+    
+    <action>
+      <name>Reboot</name>    
+    </action>
+    
+    <action>
+      <name>BottomMountLeft</name>    
+    </action>
+
+    <action>
+      <name>BottomMountRight</name>    
+    </action>
+    
+    <action>
+      <name>BottomMountMiddle</name>    
+    </action>
+    
+    
+    <action>
+      <name>TopMountUp</name>    
+    </action>
+
+    <action>
+      <name>TopMountDown</name>    
+    </action>
+    
+    <action>
+      <name>TopMountMiddle</name>    
+    </action>
+
+  </actionList>
+
+  <serviceStateTable>
+
+    <stateVariable sendEvents="yes">
+      <name>Power</name>
+      <dataType>Boolean</dataType>
+      <defaultValue>0</defaultValue>
+    </stateVariable>
+    
+    <stateVariable sendEvents="yes">
+      <name>Temperature</name>
+      <dataType>i4</dataType>
+      <defaultValue>1</defaultValue>
+    </stateVariable>
+  </serviceStateTable>
+
+</scpd>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

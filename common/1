@@ -1,0 +1,857 @@
+/*******************************************************************************
+ *
+ * Copyright (c) 2000-2003 Intel Corporation 
+ * All rights reserved. 
+ *
+ * Redistribution and use in source and binary forms, with or without 
+ * modification, are permitted provided that the following conditions are met: 
+ *
+ * - Redistributions of source code must retain the above copyright notice, 
+ * this list of conditions and the following disclaimer. 
+ * - Redistributions in binary form must reproduce the above copyright notice, 
+ * this list of conditions and the following disclaimer in the documentation 
+ * and/or other materials provided with the distribution. 
+ * - Neither name of Intel Corporation nor the names of its contributors 
+ * may be used to endorse or promote products derived from this software 
+ * without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT 
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR 
+ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL INTEL OR 
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, 
+ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, 
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR 
+ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY 
+ * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS 
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ ******************************************************************************/
+
+/*!
+ * \addtogroup UpnpSamples
+ *
+ * @{
+ *
+ * \name Device Sample Module
+ *
+ * @{
+ *
+ * \file
+ */
+
+#include "cctv_device.h"
+#include <wiringPi.h>
+#include <softPwm.h>
+//iron
+#include <sys/ioctl.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <linux/watchdog.h>
+
+#include <assert.h>
+
+#define DEFAULT_WEB_DIR "/home/pi/libupnp-1.10.0/upnp/sample/web"
+
+#define DESC_URL_SIZE 200
+
+#define SEND_VIDEO
+#define TOP_MOUNT 15
+#define BOTTOM_MOUNT 2
+/*! Global arrays for storing CCTv Control Service variable names, values,
+ * and defaults. */
+const char *cctvc_varname[] = { "Power" };
+
+char cctvc_varval[CCTV_CONTROL_VARCOUNT][CCTV_MAX_VAL_LEN];
+const char *cctvc_varval_def[] = { "1" };
+
+/*! Global arrays for storing CCTv Picture Service variable names, values,
+ * and defaults. */
+
+
+/*! The amount of time (in seconds) before advertisements will expire. */
+int default_advr_expire = 100;
+
+/*! Global structure for storing the state table for this device. */
+struct CCTvService cctv_service_table[2];
+
+/*! Device handle supplied by UPnP SDK. */
+UpnpDevice_Handle device_handle = -1;
+
+/*! Mutex for protecting the global state table data
+ * in a multi-threaded, asynchronous environment.
+ * All functions should lock this mutex before reading
+ * or writing the state table data. */
+ithread_mutex_t CCTVDevMutex;
+
+/*! Power constants */
+#define POWER_ON 1
+#define POWER_OFF 0
+
+
+/*!
+ * \brief Initializes the service table for the specified service.
+ */
+static int SetServiceTable(
+	/*! [in] one of CCTV_SERVICE_CONTROL or, CCTV_SERVICE_PICTURE. */
+	int serviceType,
+	/*! [in] UDN of device containing service. */
+	const char *UDN,
+	/*! [in] serviceId of service. */
+	const char *serviceId,
+	/*! [in] service type (as specified in Description Document) . */
+	const char *serviceTypeS,
+	/*! [in,out] service containing table to be set. */
+	struct CCTvService *out)
+{
+	int i = 0;
+
+	strcpy(out->UDN, UDN);
+	strcpy(out->ServiceId, serviceId);
+	strcpy(out->ServiceType, serviceTypeS);
+
+	switch (serviceType) {
+	case CCTV_SERVICE_CONTROL:
+		out->VariableCount = CCTV_CONTROL_VARCOUNT;
+		for (i = 0;
+		     i < cctv_service_table[CCTV_SERVICE_CONTROL].VariableCount;
+		     i++) {
+			cctv_service_table[CCTV_SERVICE_CONTROL].VariableName[i]
+			    = cctvc_varname[i];
+			cctv_service_table[CCTV_SERVICE_CONTROL].VariableStrVal[i]
+			    = cctvc_varval[i];
+			strcpy(cctv_service_table[CCTV_SERVICE_CONTROL].
+				VariableStrVal[i], cctvc_varval_def[i]);
+		}
+		break;
+	default:
+		assert(0);
+	}
+
+	return SetActionTable(serviceType, out);
+}
+
+int SetActionTable(int serviceType, struct CCTvService *out)
+{
+	if (serviceType == CCTV_SERVICE_CONTROL) {
+		out->ActionNames[0] = "PowerOn";
+		out->actions[0] = CCTvDevicePowerOn;
+		out->ActionNames[1] = "PowerOff";
+		out->actions[1] = CCTvDevicePowerOff;
+		out->ActionNames[2] = "Reboot";
+		out->actions[2] = CCTvDeviceReboot;
+		out->ActionNames[3] = "BottomMountLeft";
+		out->actions[3] = CCTvDeviceBottomMountLeft;
+		out->ActionNames[4] = "BottomMountRight";
+		out->actions[4] = CCTvDeviceBottomMountRight;
+		out->ActionNames[5] = "BottomMountMiddle";
+		out->actions[5] = CCTvDeviceBottomMountMiddle;	
+		out->ActionNames[6] = "TopMountUp";
+		out->actions[6] = CCTvDeviceTopMountUp;
+		out->ActionNames[7] = "TopMountDown";
+		out->actions[7] = CCTvDeviceTopMountDown;
+		out->ActionNames[8] = "TopMountMiddle";
+		out->actions[8] = CCTvDeviceTopMountMiddle;
+
+
+		return 1;
+	}
+
+	return 0;
+}
+
+int CCTvDeviceStateTableInit(char *DescDocURL)
+{
+	IXML_Document *DescDoc = NULL;
+	int ret = UPNP_E_SUCCESS;
+	char *servid_ctrl = NULL;
+	char *evnturl_ctrl = NULL;
+	char *ctrlurl_ctrl = NULL;
+	char *servid_pict = NULL;
+	char *evnturl_pict = NULL;
+	char *ctrlurl_pict = NULL;
+	char *udn = NULL;
+
+	/*Download description document */
+	if (UpnpDownloadXmlDoc(DescDocURL, &DescDoc) != UPNP_E_SUCCESS) {
+		SampleUtil_Print("CCTvDeviceStateTableInit -- Error Parsing %s\n",
+				 DescDocURL);
+		ret = UPNP_E_INVALID_DESC;
+		goto error_handler;
+	}
+	udn = SampleUtil_GetFirstDocumentItem(DescDoc, "UDN");
+	/* Find the CCTv Control Service identifiers */
+	if (!SampleUtil_FindAndParseService(DescDoc, DescDocURL,
+					    CCTvServiceType[CCTV_SERVICE_CONTROL],
+					    &servid_ctrl, &evnturl_ctrl,
+					    &ctrlurl_ctrl)) {
+		SampleUtil_Print("CCTvDeviceStateTableInit -- Error: Could not find Service: %s\n",
+				 CCTvServiceType[CCTV_SERVICE_CONTROL]);
+		ret = UPNP_E_INVALID_DESC;
+		goto error_handler;
+	}
+	/* set control service table */
+	SetServiceTable(CCTV_SERVICE_CONTROL, udn, servid_ctrl,
+			CCTvServiceType[CCTV_SERVICE_CONTROL],
+			&cctv_service_table[CCTV_SERVICE_CONTROL]);
+
+
+error_handler:
+	/* clean up */
+	if (udn)
+		free(udn);
+	if (servid_ctrl)
+		free(servid_ctrl);
+	if (evnturl_ctrl)
+		free(evnturl_ctrl);
+	if (ctrlurl_ctrl)
+		free(ctrlurl_ctrl);
+	if (servid_pict)
+		free(servid_pict);
+	if (evnturl_pict)
+		free(evnturl_pict);
+	if (ctrlurl_pict)
+		free(ctrlurl_pict);
+	if (DescDoc)
+		ixmlDocument_free(DescDoc);
+
+	return (ret);
+}
+
+int CCTvDeviceHandleSubscriptionRequest(const UpnpSubscriptionRequest *sr_event)
+{
+	unsigned int i = 0;
+	int cmp1 = 0;
+	int cmp2 = 0;
+	const char *l_serviceId = NULL;
+	const char *l_udn = NULL;
+	const char *l_sid = NULL;
+
+	/* lock state mutex */
+	ithread_mutex_lock(&CCTVDevMutex);
+
+	l_serviceId = UpnpString_get_String(UpnpSubscriptionRequest_get_ServiceId(sr_event));
+	l_udn = UpnpSubscriptionRequest_get_UDN_cstr(sr_event);
+	l_sid = UpnpSubscriptionRequest_get_SID_cstr(sr_event);
+	for (i = 0; i < CCTV_SERVICE_SERVCOUNT; ++i) {
+		cmp1 = strcmp(l_udn, cctv_service_table[i].UDN);
+		cmp2 = strcmp(l_serviceId, cctv_service_table[i].ServiceId);
+		if (cmp1 == 0 && cmp2 == 0) {
+#if 0
+			PropSet = NULL;
+
+			for (j = 0; j < cctv_service_table[i].VariableCount; ++j) {
+				/* add each variable to the property set */
+				/* for initial state dump */
+				UpnpAddToPropertySet(&PropSet,
+						     cctv_service_table[i].
+						     VariableName[j],
+						     cctv_service_table[i].
+						     VariableStrVal[j]);
+			}
+
+			/* dump initial state  */
+			UpnpAcceptSubscriptionExt(device_handle,
+						  l_udn,
+						  l_serviceId, PropSet, l_sid);
+			/* free document */
+			Document_free(PropSet);
+#endif
+			UpnpAcceptSubscription(device_handle,
+					       l_udn,
+					       l_serviceId,
+					       (const char **)
+					       cctv_service_table[i].VariableName,
+					       (const char **)
+					       cctv_service_table
+					       [i].VariableStrVal,
+					       cctv_service_table[i].
+					       VariableCount, l_sid);
+		}
+	}
+
+	ithread_mutex_unlock(&CCTVDevMutex);
+
+	return 1;
+}
+
+int CCTvDeviceHandleGetVarRequest(UpnpStateVarRequest *cgv_event)
+{
+	unsigned int i = 0;
+	int j = 0;
+	int gecctvar_succeeded = 0;
+
+	UpnpStateVarRequest_set_CurrentVal(cgv_event, NULL);
+
+	ithread_mutex_lock(&CCTVDevMutex);
+
+	for (i = 0; i < CCTV_SERVICE_SERVCOUNT; i++) {
+		/* check udn and service id */
+		const char *devUDN =
+			UpnpString_get_String(UpnpStateVarRequest_get_DevUDN(cgv_event));
+		const char *serviceID =
+			UpnpString_get_String(UpnpStateVarRequest_get_ServiceID(cgv_event));
+		if (strcmp(devUDN, cctv_service_table[i].UDN) == 0 &&
+		    strcmp(serviceID, cctv_service_table[i].ServiceId) == 0) {
+			/* check variable name */
+			for (j = 0; j < cctv_service_table[i].VariableCount; j++) {
+				const char *stateVarName = UpnpString_get_String(
+					UpnpStateVarRequest_get_StateVarName(cgv_event));
+				if (strcmp(stateVarName,
+					   cctv_service_table[i].VariableName[j]) == 0) {
+					gecctvar_succeeded = 1;
+					UpnpStateVarRequest_set_CurrentVal(cgv_event,
+						cctv_service_table[i].VariableStrVal[j]);
+					break;
+				}
+			}
+		}
+	}
+	if (gecctvar_succeeded) {
+		UpnpStateVarRequest_set_ErrCode(cgv_event, UPNP_E_SUCCESS);
+	} else {
+		SampleUtil_Print("Error in UPNP_CONTROL_GET_VAR_REQUEST callback:\n"
+			"   Unknown variable name = %s\n",
+			UpnpString_get_String(UpnpStateVarRequest_get_StateVarName(cgv_event)));
+		UpnpStateVarRequest_set_ErrCode(cgv_event, 404);
+		UpnpStateVarRequest_strcpy_ErrStr(cgv_event, "Invalid Variable");
+	}
+
+	ithread_mutex_unlock(&CCTVDevMutex);
+
+	return UpnpStateVarRequest_get_ErrCode(cgv_event) == UPNP_E_SUCCESS;
+}
+
+int CCTvDeviceHandleActionRequest(UpnpActionRequest *ca_event)
+{
+	/* Defaults if action not found. */
+	int action_found = 0;
+	int i = 0;
+	int service = -1;
+	int retCode = 0;
+	const char *errorString = NULL;
+	const char *devUDN = NULL;
+	const char *serviceID = NULL;
+	const char *actionName = NULL;
+	IXML_Document *actionResult = NULL;
+
+	UpnpActionRequest_set_ErrCode(ca_event, 0);
+	UpnpActionRequest_set_ActionResult(ca_event, NULL);
+
+	devUDN     = UpnpString_get_String(UpnpActionRequest_get_DevUDN(    ca_event));
+	serviceID  = UpnpString_get_String(UpnpActionRequest_get_ServiceID( ca_event));
+	actionName = UpnpString_get_String(UpnpActionRequest_get_ActionName(ca_event));
+	if (strcmp(devUDN,    cctv_service_table[CCTV_SERVICE_CONTROL].UDN) == 0 &&
+	    strcmp(serviceID, cctv_service_table[CCTV_SERVICE_CONTROL].ServiceId) == 0) {
+		/* Request for action in the CCTvDevice Control Service. */
+		service = CCTV_SERVICE_CONTROL;
+	}
+	/* Find and call appropriate procedure based on action name.
+	 * Each action name has an associated procedure stored in the
+	 * service table. These are set at initialization. */
+	for (i = 0;
+	     i < CCTV_MAXACTIONS && cctv_service_table[service].ActionNames[i] != NULL;
+	     i++) {
+		if (!strcmp(actionName, cctv_service_table[service].ActionNames[i])) {
+			if (!strcmp(cctv_service_table[CCTV_SERVICE_CONTROL].
+				    VariableStrVal[CCTV_CONTROL_POWER], "1") ||
+			    !strcmp(actionName, "PowerOn")) {
+				retCode = cctv_service_table[service].actions[i](
+					UpnpActionRequest_get_ActionRequest(ca_event),
+					&actionResult,
+					&errorString);
+				UpnpActionRequest_set_ActionResult(ca_event, actionResult);
+			} else {
+				errorString = "Power is Off";
+				retCode = UPNP_E_INTERNAL_ERROR;
+			}
+			action_found = 1;
+			break;
+		}
+	}
+
+	if (!action_found) {
+		UpnpActionRequest_set_ActionResult(ca_event, NULL);
+		UpnpActionRequest_strcpy_ErrStr(ca_event, "Invalid Action");
+		UpnpActionRequest_set_ErrCode(ca_event, 401);
+	} else {
+		if (retCode == UPNP_E_SUCCESS) {
+			UpnpActionRequest_set_ErrCode(ca_event, UPNP_E_SUCCESS);
+		} else {
+			/* copy the error string */
+			UpnpActionRequest_strcpy_ErrStr(ca_event, errorString);
+			switch (retCode) {
+			case UPNP_E_INVALID_PARAM:
+				UpnpActionRequest_set_ErrCode(ca_event, 402);
+				break;
+			case UPNP_E_INTERNAL_ERROR:
+			default:
+				UpnpActionRequest_set_ErrCode(ca_event, 501);
+				break;
+			}
+		}
+	}
+
+	return UpnpActionRequest_get_ErrCode(ca_event);
+}
+
+int CCTvDeviceSetServiceTableVar(unsigned int service, int variable, char *value)
+{
+	/* IXML_Document  *PropSet= NULL; */
+	if (service >= CCTV_SERVICE_SERVCOUNT ||
+	    variable >= cctv_service_table[service].VariableCount ||
+	    strlen(value) >= CCTV_MAX_VAL_LEN)
+		return (0);
+
+	ithread_mutex_lock(&CCTVDevMutex);
+
+	strcpy(cctv_service_table[service].VariableStrVal[variable], value);
+#if 0
+	/* Using utility api */
+	PropSet = UpnpCreatePropertySet(1,
+		cctv_service_table[service].VariableName[variable],
+		cctv_service_table[service].VariableStrVal[variable]);
+	UpnpNotifyExt(device_handle, cctv_service_table[service].UDN,
+		cctv_service_table[service].ServiceId, PropSet);
+	/* Free created property set */
+	Document_free(PropSet);
+#endif
+/*	UpnpNotify(device_handle,
+		cctv_service_table[service].UDN,
+		cctv_service_table[service].ServiceId,
+		(const char **)&cctv_service_table[service].VariableName[variable],
+		(const char **)&cctv_service_table[service].VariableStrVal[variable], 1);
+*/
+	ithread_mutex_unlock(&CCTVDevMutex);
+
+	return 1;
+}
+
+/*!
+ * \brief Turn the power on/off, update the CCTvDevice control service
+ * state table, and notify all subscribed control points of the
+ * updated state.
+ */
+static int CCTvDeviceSetPower(
+	/*! [in] If 1, turn power on. If 0, turn power off. */
+	int on)
+{
+	char value[CCTV_MAX_VAL_LEN];
+	int ret = 0;
+
+	if (on != POWER_ON && on != POWER_OFF) {
+		SampleUtil_Print("error: can't set power to value %d\n", on);
+		return 0;
+	}
+
+	/* Vendor-specific code to turn the power on/off goes here. */
+
+	sprintf(value, "%d", on);
+	ret = CCTvDeviceSetServiceTableVar(CCTV_SERVICE_CONTROL, CCTV_CONTROL_POWER,
+					 value);
+
+	return ret;
+}
+int CCTvDeviceBottomMountLeft(IXML_Document* in, IXML_Document ** out, const char ** errorString){
+	
+	(*out) = NULL;
+	(*errorString) = NULL;
+	if (UpnpAddToActionResponse(out, "BottomMountLeft",
+			    CCTvServiceType[CCTV_SERVICE_CONTROL],
+			   NULL , NULL) != UPNP_E_SUCCESS) {
+		(*out) = NULL;
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+	}
+	softPwmWrite(BOTTOM_MOUNT,21);
+	return UPNP_E_SUCCESS;
+	in = in;
+
+}
+
+int CCTvDeviceBottomMountRight(IXML_Document* in, IXML_Document ** out, const char ** errorString){
+
+	(*out) = NULL;
+	(*errorString) = NULL;
+	if (UpnpAddToActionResponse(out, "BottomMountRight",
+			    CCTvServiceType[CCTV_SERVICE_CONTROL],
+			   NULL , NULL) != UPNP_E_SUCCESS) {
+		(*out) = NULL;
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+	}
+	softPwmWrite(BOTTOM_MOUNT,8);
+	return UPNP_E_SUCCESS;
+	in = in;
+
+}
+
+int CCTvDeviceBottomMountMiddle(IXML_Document* in, IXML_Document ** out, const char ** errorString){
+
+	(*out) = NULL;
+	(*errorString) = NULL;
+	if (UpnpAddToActionResponse(out, "BottomMountMiddle",
+			    CCTvServiceType[CCTV_SERVICE_CONTROL],
+			   NULL , NULL) != UPNP_E_SUCCESS) {
+		(*out) = NULL;
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+	}
+	softPwmWrite(BOTTOM_MOUNT,13);
+	return UPNP_E_SUCCESS;
+	in = in;
+}
+
+int CCTvDeviceTopMountUp(IXML_Document* in, IXML_Document ** out, const char ** errorString){
+
+	(*out) = NULL;
+	(*errorString) = NULL;
+	if (UpnpAddToActionResponse(out, "TopMountUp",
+			    CCTvServiceType[CCTV_SERVICE_CONTROL],
+			   NULL , NULL) != UPNP_E_SUCCESS) {
+		(*out) = NULL;
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+	}
+	softPwmWrite(TOP_MOUNT,15);
+	return UPNP_E_SUCCESS;
+	in = in;
+}
+
+int CCTvDeviceTopMountDown(IXML_Document* in, IXML_Document ** out, const char ** errorString){
+
+	(*out) = NULL;
+	(*errorString) = NULL;
+	if (UpnpAddToActionResponse(out, "TopMountDown",
+			    CCTvServiceType[CCTV_SERVICE_CONTROL],
+			   NULL , NULL) != UPNP_E_SUCCESS) {
+		(*out) = NULL;
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+	}
+	softPwmWrite(TOP_MOUNT,25);
+	return UPNP_E_SUCCESS;
+	in = in;
+}
+
+int CCTvDeviceTopMountMiddle(IXML_Document* in, IXML_Document ** out, const char ** errorString){
+
+	(*out) = NULL;
+	(*errorString) = NULL;
+	if (UpnpAddToActionResponse(out, "TopMountMiddle",
+			    CCTvServiceType[CCTV_SERVICE_CONTROL],
+			   NULL , NULL) != UPNP_E_SUCCESS) {
+		(*out) = NULL;
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+	}
+	softPwmWrite(TOP_MOUNT,20);
+	return UPNP_E_SUCCESS;
+	in = in;
+}
+int CCTvDevicePowerOn(IXML_Document * in,IXML_Document **out,
+	const char **errorString)
+{
+	(*out) = NULL;
+	(*errorString) = NULL;
+
+	if (CCTvDeviceSetPower(POWER_ON)) {
+		/* create a response */
+		if (UpnpAddToActionResponse(out, "PowerOn",
+					    CCTvServiceType[CCTV_SERVICE_CONTROL],
+					    "Power", "1") != UPNP_E_SUCCESS) {
+			(*out) = NULL;
+			(*errorString) = "Internal Error";
+			return UPNP_E_INTERNAL_ERROR;
+		}
+#ifdef SEND_VIDEO
+		//send video
+		system("raspivid -hf -n -t 0 -rot 180 -w 640 -h 480 -fps 30 -b 1000000 -o - | gst-launch-1.0 -e -vvvv fdsrc ! h264parse ! rtph264pay pt=96 config-interval=5 ! udpsink host=165.229.185.169 port=5001");
+#endif
+		return UPNP_E_SUCCESS;
+	} else {
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+	}
+	in = in;
+}
+
+int CCTvDevicePowerOff(IXML_Document *in, IXML_Document **out,
+	const char **errorString)
+{
+	(*out) = NULL;
+	(*errorString) = NULL;
+	if (CCTvDeviceSetPower(POWER_OFF)) {
+		/*create a response */
+
+		if (UpnpAddToActionResponse(out, "PowerOff",
+					    CCTvServiceType[CCTV_SERVICE_CONTROL],
+					    "Power", "0") != UPNP_E_SUCCESS) {
+			(*out) = NULL;
+			(*errorString) = "Internal Error";
+			return UPNP_E_INTERNAL_ERROR;
+		}
+#ifdef SEND_VIDEO
+		system("killall raspivid");
+#endif
+		return UPNP_E_SUCCESS;
+	} else {
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+	}
+	in = in;
+}
+
+static int watchdogFlag = 0;
+static int fd;
+
+int CCTvDeviceReboot(IXML_Document* in, IXML_Document ** out, const char ** errorString){
+
+	int interval = 15;
+	(*out) = NULL;
+	(*errorString) = NULL;
+	if (UpnpAddToActionResponse(out, "Reboot",
+			    CCTvServiceType[CCTV_SERVICE_CONTROL],
+			   NULL , NULL) != UPNP_E_SUCCESS) {
+		(*out) = NULL;
+		(*errorString) = "Internal Error";
+		return UPNP_E_INTERNAL_ERROR;
+
+	}
+
+	//Here
+	watchdogFlag = 1;
+	printf("WD: Error, reboot after 15 sec\n");
+	ioctl(fd, WDIOC_SETTIMEOUT, &interval);
+	CCTvDeviceStop();
+
+	return UPNP_E_SUCCESS;
+	in = in;
+}
+int CCTvDeviceCallbackEventHandler(Upnp_EventType EventType, const void *Event, void *Cookie)
+{
+	switch (EventType) {
+	case UPNP_EVENT_SUBSCRIPTION_REQUEST:
+		CCTvDeviceHandleSubscriptionRequest((UpnpSubscriptionRequest *)Event);
+		break;
+	case UPNP_CONTROL_GET_VAR_REQUEST:
+		CCTvDeviceHandleGetVarRequest((UpnpStateVarRequest *)Event);
+		break;
+	case UPNP_CONTROL_ACTION_REQUEST:
+		CCTvDeviceHandleActionRequest((UpnpActionRequest *)Event);
+		break;
+		/* ignore these cases, since this is not a control point */
+	case UPNP_DISCOVERY_ADVERTISEMENT_ALIVE:
+	case UPNP_DISCOVERY_SEARCH_RESULT:
+	case UPNP_DISCOVERY_SEARCH_TIMEOUT:
+	case UPNP_DISCOVERY_ADVERTISEMENT_BYEBYE:
+	case UPNP_CONTROL_ACTION_COMPLETE:
+	case UPNP_CONTROL_GET_VAR_COMPLETE:
+	case UPNP_EVENT_RECEIVED:
+	case UPNP_EVENT_RENEWAL_COMPLETE:
+	case UPNP_EVENT_SUBSCRIBE_COMPLETE:
+	case UPNP_EVENT_UNSUBSCRIBE_COMPLETE:
+		break;
+	default:
+		SampleUtil_Print
+		    ("Error in CCTvDeviceCallbackEventHandler: unknown event type %d\n",
+		     EventType);
+	}
+	/* Print a summary of the event received */
+	SampleUtil_PrintEvent(EventType, Event);
+
+	return 0;
+	Cookie = Cookie;
+}
+
+int CCTvDeviceStart(char *ip_address, unsigned short port,
+		  const char *desc_doc_name, const char *web_dir_path,
+		  print_string pfun, int combo)
+{
+	int ret = UPNP_E_SUCCESS;
+	char desc_doc_url[DESC_URL_SIZE];
+
+	ithread_mutex_init(&CCTVDevMutex, NULL);
+
+	SampleUtil_Initialize(pfun);
+	SampleUtil_Print("Initializing UPnP Sdk with\n"
+			 "\tipaddress = %s port = %u\n",
+			 ip_address ? ip_address : "{NULL}", port);
+	ret = UpnpInit2(ip_address, port);
+	if (ret != UPNP_E_SUCCESS) {
+		SampleUtil_Print("Error with UpnpInit2 -- %d\n", ret);
+		UpnpFinish();
+
+		return ret;
+	}
+	ip_address = UpnpGetServerIpAddress();
+	port = UpnpGetServerPort();
+	SampleUtil_Print("UPnP Initialized\n"
+			 "\tipaddress = %s port = %u\n",
+			 ip_address ? ip_address : "{NULL}", port);
+	if (!desc_doc_name) {
+		if (combo) {
+			desc_doc_name = "cctvcombodesc.xml";
+		} else {
+			desc_doc_name = "cctvdevicedesc.xml";
+		}
+	}
+	if (!web_dir_path) {
+		web_dir_path = DEFAULT_WEB_DIR;
+	}
+	snprintf(desc_doc_url, DESC_URL_SIZE, "http://%s:%d/%s", ip_address,
+		 port, desc_doc_name);
+	SampleUtil_Print("Specifying the webserver root directory -- %s\n",
+			 web_dir_path);
+	ret = UpnpSetWebServerRootDir(web_dir_path);
+	if (ret != UPNP_E_SUCCESS) {
+		SampleUtil_Print
+		    ("Error specifying webserver root directory -- %s: %d\n",
+		     web_dir_path, ret);
+		UpnpFinish();
+
+		return ret;
+	}
+	SampleUtil_Print("Registering the RootDevice\n"
+			 "\t with desc_doc_url: %s\n", desc_doc_url);
+	ret = UpnpRegisterRootDevice(desc_doc_url, CCTvDeviceCallbackEventHandler,
+				     &device_handle, &device_handle);
+	if (ret != UPNP_E_SUCCESS) {
+		SampleUtil_Print("Error registering the rootdevice : %d\n",
+				 ret);
+		UpnpFinish();
+
+		return ret;
+	} else {
+		SampleUtil_Print("RootDevice Registered\n"
+				 "Initializing State Table\n");
+		CCTvDeviceStateTableInit(desc_doc_url);
+		SampleUtil_Print("State Table Initialized\n");
+		ret = UpnpSendAdvertisement(device_handle, default_advr_expire);
+		if (ret != UPNP_E_SUCCESS) {
+			SampleUtil_Print("Error sending advertisements : %d\n",
+					 ret);
+			UpnpFinish();
+
+			return ret;
+		}
+		SampleUtil_Print("Advertisements Sent\n");
+	}
+
+	return UPNP_E_SUCCESS;
+}
+
+int CCTvDeviceStop(void)
+{
+	UpnpUnRegisterRootDevice(device_handle);
+	UpnpFinish();
+	SampleUtil_Finish();
+	ithread_mutex_destroy(&CCTVDevMutex);
+
+	return UPNP_E_SUCCESS;
+}
+
+//iron
+
+void *CCTvDeviceCommandLoop(void *args)
+{
+	int stoploop = 0;
+	char cmdline[100];
+	char cmd[100];
+	
+	ithread_t watchdog_thread;
+	fd = open("/dev/watchdog0", O_RDWR);
+
+	if (fd == -1)
+	{
+		printf("Error\n");
+	}
+
+	ithread_create(&watchdog_thread, NULL, CCTvWatchdog, NULL);
+	
+	UpnpNotify(device_handle,
+		cctv_service_table[0].UDN,
+		cctv_service_table[0].ServiceId,
+		NULL,NULL,0);
+	while (!stoploop) {
+		sprintf(cmdline, " ");
+		sprintf(cmd, " ");
+		SampleUtil_Print("\n>> ");
+		/* Get a command line */
+		char *s = fgets(cmdline, 100, stdin);
+		if (!s)
+			break;
+		sscanf(cmdline, "%s", cmd);
+		if (strcasecmp(cmd, "exit") == 0) {
+			SampleUtil_Print("Shutting down...\n");
+			CCTvDeviceStop();
+			write(fd, "V", 1);
+			close(fd);
+			exit(0);
+		} else {
+			SampleUtil_Print("\n   Unknown command: %s\n\n", cmd);
+			SampleUtil_Print("   Valid Commands:\n"
+					 "     Exit\n\n");
+		}
+	}
+
+	return NULL;
+	args = args;
+}
+
+int device_main(int argc, char *argv[])
+{
+	unsigned int portTemp = 0;
+	char *ip_address = NULL;
+	char *desc_doc_name = NULL;
+	char *web_dir_path = NULL;
+	unsigned short port = 0;
+	int i = 0;
+	
+	if(wiringPiSetup() ==-1)
+	{	
+		printf("wiringPiSetup() Error \n");
+		exit(0);
+	}
+	pinMode(TOP_MOUNT,OUTPUT);
+	pinMode(BOTTOM_MOUNT,OUTPUT);
+
+	softPwmCreate(TOP_MOUNT,0,200);
+	softPwmCreate(BOTTOM_MOUNT,0,200);
+
+
+	SampleUtil_Initialize(linux_print);
+	/* Parse options */
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-ip") == 0) {
+			ip_address = argv[++i];
+		} else if (strcmp(argv[i], "-port") == 0) {
+			sscanf(argv[++i], "%u", &portTemp);
+		} else if (strcmp(argv[i], "-desc") == 0) {
+			desc_doc_name = argv[++i];
+		} else if (strcmp(argv[i], "-webdir") == 0) {
+			web_dir_path = argv[++i];
+		} else if (strcmp(argv[i], "-help") == 0) {
+			SampleUtil_Print("Usage: %s -ip ipaddress -port port"
+					 " -desc desc_doc_name -webdir web_dir_path"
+					 " -help (this message)\n", argv[0]);
+			SampleUtil_Print
+			    ("\tipaddress:     IP address of the device"
+			     " (must match desc. doc)\n"
+			     "\t\te.g.: 192.168.0.4\n"
+			     "\tport:          Port number to use for"
+			     " receiving UPnP messages (must match desc. doc)\n""\t\te.g.: 5431\n"
+			     "\tdesc_doc_name: name of device description document\n"
+			     "\t\te.g.: tvdevicedesc.xml\n"
+			     "\tweb_dir_path: Filesystem path where web files"
+			     " related to the device are stored\n"
+			     "\t\te.g.: /upnp/sample/tvdevice/web\n");
+			return 1;
+		}
+	}
+	port = (unsigned short)portTemp;
+	return CCTvDeviceStart(ip_address, port, desc_doc_name, web_dir_path,
+			     linux_print, 0);
+}

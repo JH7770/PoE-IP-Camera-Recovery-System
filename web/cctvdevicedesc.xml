@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion>
+    <major>1</major>
+    <minor>0</minor>
+  </specVersion>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:cctvdevice:1</deviceType>
+    <friendlyName>UPnP CCTV Emulator</friendlyName>
+    <manufacturer>CCtv Manufacturer Name</manufacturer>
+    <manufacturerURL>http://www.manufacturer.com</manufacturerURL>
+    <modelDescription>UPnP Camera Device Emulator 1.0</modelDescription>
+    <modelName>CCTVEmulator</modelName>
+    <modelNumber>1.0</modelNumber>
+    <modelURL>http://www.manufacturer.com/CCTVEmulator/</modelURL>
+    <serialNumber>123456789001</serialNumber>
+    <UDN>uuid:Upnp-CCTVEmulator-1_0-raspi187</UDN>
+    <UPC>123456789</UPC>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:cctvcontrol:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:cctvcontrol1</serviceId>
+        <controlURL>/upnp/control/cctvtvcontrol1</controlURL>
+        <eventSubURL>/upnp/event/cctvtvcontrol1</eventSubURL>
+        <SCPDURL>/cctvcontrolSCPD.xml</SCPDURL>
+      </service>
+    </serviceList>
+   <presentationURL>/cctvdevicepres.html</presentationURL>
+</device>
+</root>
